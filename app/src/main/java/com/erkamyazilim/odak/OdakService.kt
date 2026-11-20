@@ -12,6 +12,7 @@ import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.view.Gravity
 import android.view.KeyEvent
@@ -58,7 +59,11 @@ class OdakService : AccessibilityService() {
         val isReels: Boolean,
         val isSearch: Boolean,
         val selected: Boolean
-    )
+    ) {
+        val isHome get() = id.endsWith("/feed_tab") || desc.contains("ana sayfa") || desc.contains("home")
+        val isProfile get() = id.endsWith("/profile_tab") || desc.contains("profil")
+        val isDirect get() = id.endsWith("/direct_tab") || desc.contains("mesaj") || desc.contains("message")
+    }
 
     private val handler = Handler(Looper.getMainLooper())
     private var wm: WindowManager? = null
@@ -80,6 +85,40 @@ class OdakService : AccessibilityService() {
     private var lastViewerResult = false
     private var lastDumpAt = 0L
 
+    // Kullanım süresi
+    private var inIg = false
+    private var lastTick = 0L
+    private var lastLeaveAt = 0L
+    private var lastFlush = 0L
+    private var section = Db.SEC_OTHER
+    private val pending = HashMap<String, Long>()
+
+    // Ekran okuma
+    private var cachedInfo: ScreenInfo? = null
+    private var lastInfoAt = 0L
+    private var lastProfileSaveAt = 0L
+    private val scanSeen = HashSet<String>()
+    private var scanSeenId = 0L
+    private var storySessionActive = false
+    private var storySessionId = 0L
+    private var storySessionPrev = 0L
+    private var storySessionStart = 0L
+    private var lastStorySeenAt = 0L
+    private val storySeen = HashSet<String>()
+
+    // Kilit ekranı
+    private var lockView: View? = null
+    private var lockReason = 0
+
+    private val tick = object : Runnable {
+        override fun run() {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (inIg && !pm.isInteractive) leaveInstagram()
+            if (inIg) safeProcess()
+            handler.postDelayed(this, 5000)
+        }
+    }
+
     /** "Ekran bilgisini kopyala" için son görülen Instagram ekranının özeti (sadece kimlikler). */
     @Volatile
     var lastDump: String = ""
@@ -89,6 +128,9 @@ class OdakService : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        handler.removeCallbacks(tick)
+        handler.postDelayed(tick, 5000)
+        if (Prefs(this).weekly) Report.schedule(this)
         schedule(50)
     }
 
@@ -139,22 +181,51 @@ class OdakService : AccessibilityService() {
     private fun process() {
         val root = rootInActiveWindow ?: return
         val pkg = root.packageName?.toString() ?: return
-        if (pkg == packageName && blockView != null) return
+        if (pkg == packageName && (blockView != null || lockView != null)) return
         if (pkg != IG) {
+            leaveInstagram()
             removeBar()
             removeBlock()
+            removeLock()
             return
         }
+        enterInstagram()
 
         val prefs = Prefs(this)
         val tabs = findTabs(root)
-        val viewer = hasFullScreenViewer(root)
-        maybeDump(root, tabs, viewer)
+        val info = screenInfo(root)
+        val viewer = info.clipsViewerFull || hasFullScreenViewer(root)
+
+        accountUsage()
+        section = detectSection(info, tabs)
+        maybeDump(info, tabs, viewer)
+        readProfile(info, tabs)
+        readFollowList(info, prefs)
+        readStoryViewers(info)
 
         if (!prefs.master) {
             removeBar()
             removeBlock()
+            removeLock()
             return
+        }
+
+        // Zaman kuralları (tarama sırasında kilitleme)
+        val wall = System.currentTimeMillis()
+        val reason = when {
+            prefs.scanId > 0L -> 0
+            wall < prefs.allowUntil -> 0
+            prefs.nightActiveNow() -> 1
+            prefs.limitOn && todayUsageMs() >= prefs.limitMin * 60_000L -> 2
+            else -> 0
+        }
+        if (reason != 0) {
+            removeBar()
+            removeBlock()
+            showLock(reason, prefs)
+            return
+        } else {
+            removeLock()
         }
 
         val selected = tabs.firstOrNull { it.selected }
@@ -163,19 +234,161 @@ class OdakService : AccessibilityService() {
             if (prefs.reels && now - lastRedirectAt > 700) {
                 lastRedirectAt = now
                 tabs.firstOrNull { !it.isReels }?.let { clickNode(it.node) }
+                Db.get(this).inc(Db.today(), Db.CNT_BLOCK_TAB)
                 schedule(250)
             }
         } else if (viewer) {
             val fromExplore = selected?.isSearch == true
-            if ((fromExplore && prefs.explore) || (!fromExplore && prefs.dm)) {
-                block(prefs)
-            }
+            if (fromExplore && prefs.explore) block(prefs, Db.CNT_BLOCK_EXPLORE)
+            else if (!fromExplore && prefs.dm) block(prefs, Db.CNT_BLOCK_DM)
         }
 
         if (prefs.reels && tabs.size >= 3 && tabs.any { it.isReels }) {
             updateBar(root, tabs)
         } else {
             removeBar()
+        }
+    }
+
+    private fun screenInfo(root: AccessibilityNodeInfo): ScreenInfo {
+        val now = SystemClock.uptimeMillis()
+        val c = cachedInfo
+        if (c != null && now - lastInfoAt < 400) return c
+        val (w, h) = screenSize()
+        val info = ScreenReader.scan(root, w, h)
+        cachedInfo = info
+        lastInfoAt = now
+        return info
+    }
+
+    // ---------------- Kullanım süresi ----------------
+
+    private fun enterInstagram() {
+        if (inIg) return
+        inIg = true
+        val now = SystemClock.elapsedRealtime()
+        lastTick = now
+        if (now - lastLeaveAt > 10_000L || lastLeaveAt == 0L) {
+            try {
+                Db.get(this).inc(Db.today(), Db.CNT_OPENS)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun accountUsage() {
+        if (!inIg) return
+        val now = SystemClock.elapsedRealtime()
+        val d = (now - lastTick).coerceIn(0L, 15_000L)
+        lastTick = now
+        pending[section] = (pending[section] ?: 0L) + d
+        if (now - lastFlush > 20_000L) flush()
+    }
+
+    private fun leaveInstagram() {
+        if (!inIg) return
+        accountUsage()
+        inIg = false
+        lastLeaveAt = SystemClock.elapsedRealtime()
+        flush()
+    }
+
+    private fun flush() {
+        lastFlush = SystemClock.elapsedRealtime()
+        if (pending.isEmpty()) return
+        try {
+            val db = Db.get(this)
+            val day = Db.today()
+            for ((sec, ms) in pending) db.addUsage(day, sec, ms)
+        } catch (_: Exception) {
+        }
+        pending.clear()
+    }
+
+    fun todayUsageMs(): Long = try {
+        Db.get(this).usageTotal(Db.today()) + pending.values.sum()
+    } catch (_: Exception) {
+        pending.values.sum()
+    }
+
+    private fun detectSection(info: ScreenInfo, tabs: List<Tab>): String {
+        if (info.reelViewer) return Db.SEC_STORIES
+        if (info.direct) return Db.SEC_DM
+        val sel = tabs.firstOrNull { it.selected } ?: return Db.SEC_OTHER
+        return when {
+            sel.isReels -> Db.SEC_OTHER
+            sel.isSearch -> Db.SEC_EXPLORE
+            sel.isDirect -> Db.SEC_DM
+            sel.isProfile -> Db.SEC_PROFILE
+            sel.isHome -> Db.SEC_FEED
+            else -> Db.SEC_OTHER
+        }
+    }
+
+    // ---------------- Takipçi ve hikâye okuma ----------------
+
+    private fun readProfile(info: ScreenInfo, tabs: List<Tab>) {
+        val f = info.followers ?: return
+        val g = info.following ?: return
+        if (!info.editProfile) return
+        if (tabs.firstOrNull { it.selected }?.isProfile != true) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastProfileSaveAt < 60_000L && lastProfileSaveAt != 0L) return
+        lastProfileSaveAt = now
+        try {
+            Db.get(this).saveFollowCounts(f, g)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun readFollowList(info: ScreenInfo, prefs: Prefs) {
+        val id = prefs.scanId
+        if (id <= 0L) return
+        if (scanSeenId != id) {
+            scanSeen.clear()
+            scanSeenId = id
+        }
+        if (info.followingTabSelected || info.followListUsers.isEmpty()) return
+        val fresh = info.followListUsers.filter { scanSeen.add(it) }
+        if (fresh.isEmpty()) return
+        try {
+            Db.get(this).addScanUsers(id, fresh)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun readStoryViewers(info: ScreenInfo) {
+        val el = SystemClock.elapsedRealtime()
+        val isSheet = info.reelViewer && info.viewersKeyword && info.usernames.isNotEmpty() &&
+            info.followListUsers.isEmpty()
+        if (!isSheet) {
+            if (storySessionActive && el - lastStorySeenAt > 8_000L) storySessionActive = false
+            return
+        }
+        lastStorySeenAt = el
+        try {
+            val db = Db.get(this)
+            if (!storySessionActive) {
+                val wall = System.currentTimeMillis()
+                val st = db.currentStory(wall)
+                storySessionActive = true
+                storySessionId = st.id
+                storySessionPrev = st.lastCheck
+                storySessionStart = wall
+                storySeen.clear()
+                db.setStoryCheck(st.id, wall)
+            }
+            val fresh = info.usernames.filter { storySeen.add(it) }
+            if (fresh.isNotEmpty()) db.addStoryViewers(storySessionId, fresh, storySessionStart, storySessionPrev)
+        } catch (_: Exception) {
+        }
+    }
+
+    /** Uygulamadan "taramayı bitir" denince bellekteki listeyi sıfırlar. */
+    fun resetScanMemory() {
+        handler.post {
+            scanSeen.clear()
+            scanSeenId = 0L
         }
     }
 
@@ -261,26 +474,7 @@ class OdakService : AccessibilityService() {
                 if (isFullScreen(n)) return true
             }
         }
-        // Yedek: kimliğinde "clips_viewer" geçen tam ekran bir görünüm ara (sık tarama yapma).
-        val now = SystemClock.uptimeMillis()
-        if (now - lastViewerScanAt < 450) return lastViewerResult
-        lastViewerScanAt = now
-        var found = false
-        val queue = ArrayDeque<AccessibilityNodeInfo>()
-        queue.add(root)
-        var count = 0
-        while (queue.isNotEmpty() && count < 400) {
-            val n = queue.removeFirst()
-            count++
-            val id = n.viewIdResourceName
-            if (id != null && id.contains("clips_viewer") && isFullScreen(n)) {
-                found = true
-                break
-            }
-            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
-        }
-        lastViewerResult = found
-        return found
+        return false
     }
 
     private fun clickNode(n: AccessibilityNodeInfo): Boolean {
@@ -294,29 +488,24 @@ class OdakService : AccessibilityService() {
         return false
     }
 
-    private fun maybeDump(root: AccessibilityNodeInfo, tabs: List<Tab>, viewer: Boolean) {
+    private fun maybeDump(info: ScreenInfo, tabs: List<Tab>, viewer: Boolean) {
         val now = SystemClock.uptimeMillis()
         if (now - lastDumpAt < 2000) return
         lastDumpAt = now
         val sb = StringBuilder()
-        sb.append("viewer=").append(viewer).append('\n')
+        sb.append("viewer=").append(viewer).append(" section=").append(section)
+            .append(" reelViewer=").append(info.reelViewer).append(" viewersWord=").append(info.viewersKeyword)
+            .append(" editProfile=").append(info.editProfile)
+            .append(" followers=").append(info.followers).append(" following=").append(info.following)
+            .append(" followList=").append(info.followListUsers.size).append(" usernames=").append(info.usernames.size)
+            .append('\n')
         sb.append("tabs=").append(tabs.size).append('\n')
         for (t in tabs) {
             sb.append(" - ").append(t.id.substringAfter(":id/")).append(" | ").append(t.desc.take(30))
                 .append(" | sel=").append(t.selected).append(" | reels=").append(t.isReels)
                 .append(" | ").append(t.rect.toShortString()).append('\n')
         }
-        val ids = LinkedHashSet<String>()
-        val queue = ArrayDeque<AccessibilityNodeInfo>()
-        queue.add(root)
-        var count = 0
-        while (queue.isNotEmpty() && count < 600 && ids.size < 120) {
-            val n = queue.removeFirst()
-            count++
-            n.viewIdResourceName?.let { ids.add(it.substringAfter(":id/")) }
-            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
-        }
-        sb.append("ids=").append(ids.joinToString(","))
+        sb.append("ids=").append(info.ids.take(150).joinToString(","))
         lastDump = sb.toString()
     }
 
@@ -493,12 +682,16 @@ class OdakService : AccessibilityService() {
 
     // ---------------- Engel ekranı ----------------
 
-    private fun block(prefs: Prefs) {
+    private fun block(prefs: Prefs, counter: String) {
         val now = SystemClock.uptimeMillis()
         if (now - lastBlockAt < 900) return
         lastBlockAt = now
         performGlobalAction(GLOBAL_ACTION_BACK)
         prefs.blockedToday = prefs.blockedToday + 1
+        try {
+            Db.get(this).inc(Db.today(), counter)
+        } catch (_: Exception) {
+        }
         showBlock()
     }
 
@@ -568,7 +761,116 @@ class OdakService : AccessibilityService() {
 
     private fun cleanup() {
         handler.removeCallbacksAndMessages(null)
+        leaveInstagram()
         removeBar()
         removeBlock()
+        removeLock()
+    }
+
+    // ---------------- Kilit ekranı (ders/gece modu, süre sınırı) ----------------
+
+    private inner class LockLayout(ctx: Context) : LinearLayout(ctx) {
+        override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+            if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+                if (event.action == KeyEvent.ACTION_UP) goHome()
+                return true
+            }
+            return super.dispatchKeyEvent(event)
+        }
+    }
+
+    private fun goHome() {
+        performGlobalAction(GLOBAL_ACTION_HOME)
+        removeLock()
+    }
+
+    private fun hhmm(min: Int): String = String.format(java.util.Locale.US, "%02d:%02d", min / 60, min % 60)
+
+    private fun showLock(reason: Int, prefs: Prefs) {
+        if (lockView != null && lockReason == reason) return
+        removeLock()
+        val w = wm ?: return
+        val root = LockLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setBackgroundColor(C.DARK)
+            setPadding(dp(28), dp(64), dp(28), dp(48))
+            isClickable = true
+            isFocusable = true
+            isFocusableInTouchMode = true
+        }
+        val center = vertical().apply { gravity = Gravity.CENTER }
+        val ic = if (reason == 1) R.drawable.ic_moon else R.drawable.ic_clock
+        center.addView(iconBox(ic, C.MINT, 0x247FD6CB, 96, 44, 48f))
+        val title = if (reason == 1) "Ders / gece modu" else "Bugünlük süren doldu"
+        val msg = if (reason == 1) "Instagram ${hhmm(prefs.nightEnd)}'e kadar kilitli. Şimdi başka işine odaklan."
+        else "Bugün ${prefs.limitMin} dakikanı kullandın. Yarın görüşürüz."
+        center.add(label(title, 30f, Color.WHITE, bold = true).apply { gravity = Gravity.CENTER }, topDp = 22)
+        center.add(label(msg, 16f, C.DARK_TEXT).apply { gravity = Gravity.CENTER }, topDp = 12)
+        root.add(center, height = 0, weight = 1f)
+        val home = TextView(this).apply {
+            text = "Ana ekrana dön"
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setTextColor(C.DARK)
+            typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)
+            background = rounded(Color.WHITE, 27f)
+            isClickable = true
+            setOnClickListener { goHome() }
+        }
+        root.add(home, height = dp(54))
+        val more = TextView(this).apply {
+            text = "10 dk daha aç (30 sn bekle)"
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setTextColor(C.DARK_SUB)
+            setPadding(0, dp(14), 0, dp(14))
+            isClickable = true
+        }
+        var ready = false
+        var started = false
+        more.setOnClickListener {
+            if (ready) {
+                Prefs(this).allowUntil = System.currentTimeMillis() + 10 * 60_000L
+                removeLock()
+                return@setOnClickListener
+            }
+            if (started) return@setOnClickListener
+            started = true
+            var left = 30
+            val r = object : Runnable {
+                override fun run() {
+                    if (lockView == null) return
+                    if (left <= 0) {
+                        ready = true
+                        more.text = "10 dakikalığına aç"
+                        more.setTextColor(C.MINT)
+                        return
+                    }
+                    more.text = "Bekle… $left"
+                    left--
+                    handler.postDelayed(this, 1000)
+                }
+            }
+            handler.post(r)
+        }
+        root.add(more, topDp = 8)
+        try {
+            w.addView(root, overlayParams(null, true))
+            lockView = root
+            lockReason = reason
+            root.requestFocus()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun removeLock() {
+        val v = lockView ?: return
+        lockView = null
+        lockReason = 0
+        try {
+            wm?.removeView(v)
+        } catch (_: Exception) {
+        }
     }
 }
