@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Odak</string>
+    <string name="service_desc">Odak, Instagram\'da Reels simgesini gizler ve Reels videolarının açılmasını engeller. Sadece Instagram açıkken çalışır; ekranındaki hiçbir şeyi kaydetmez ve internete göndermez.</string>
+</resources>
